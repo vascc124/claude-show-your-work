@@ -59,6 +59,14 @@ test('Linux gets its own ffmpeg notice, with a package manager instead of Homebr
   expect(noticeOf(new Error(noFfmpeg(true)), '/Users/u/a.mp4', '/Users/u').text.includes('brew install ffmpeg')).toBe(true)
 })
 
+test('Windows gets a winget ffmpeg notice', () => {
+  const n = noticeOf(new Error(noFfmpeg(false, true)), 'C:/Users/u/a.mp4', 'C:/Users/u')
+  expect(n.kind).toBe('no_ffmpeg')
+  expect(n.text.includes('winget install Gyan.FFmpeg')).toBe(true)
+  expect(n.prompt.includes('winget install Gyan.FFmpeg')).toBe(true)
+  expect(/brew|apt/.test(n.text + n.prompt + n.message)).toBe(false)
+})
+
 test('each install gets a made-up name, the same every time', () => {
   const id = '8f14e45f-ceea-467f-a9d3-6c1b7c8d2e11'
   expect(nicknameOf(id)).toBe(nicknameOf(id))

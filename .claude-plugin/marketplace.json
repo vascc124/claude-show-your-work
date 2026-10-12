@@ -1,10 +1,10 @@
 {
-  "name": "iamumeransari",
+  "name": "vascc124",
   "owner": {
-    "name": "Umer Ansari"
+    "name": "vascc124"
   },
   "metadata": {
-    "description": "show-your-work: Claude shows screenshots and videos of its work inline in your terminal"
+    "description": "show-your-work with Windows 11 support: Claude shows screenshots and videos of its work inline in your terminal"
   },
   "plugins": [
     {

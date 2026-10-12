@@ -31,6 +31,16 @@ test('typed and dragged-in paths resolve', () => {
   expect(expand('img/a.png', '/w/', '/Users/u')).toBe('/w/img/a.png')
 })
 
+test('Windows paths resolve with forward slashes, Git Bash ones to their drive', () => {
+  expect(expand('C:\\Users\\u\\Desktop\\a b.png', 'C:/w', 'C:/Users/u', true)).toBe('C:/Users/u/Desktop/a b.png')
+  expect(expand('"C:\\Users\\u\\a.png"', 'C:/w', 'C:/Users/u', true)).toBe('C:/Users/u/a.png')
+  expect(expand('/c/Users/u/a.png', 'C:/w', 'C:/Users/u', true)).toBe('C:/Users/u/a.png')
+  expect(expand('img\\a.png', 'C:/w/', 'C:/Users/u', true)).toBe('C:/w/img/a.png')
+  expect(expand('~/Pictures/a.png', 'C:/w', 'C:/Users/u', true)).toBe('C:/Users/u/Pictures/a.png')
+  expect(expand('//server/share/a.png', 'C:/w', 'C:/Users/u', true)).toBe('//server/share/a.png')
+  expect(resumeCommand('id1', true)).toBe('$env:CLAUDE_CODE_DISABLE_AGENT_VIEW=1; claude --resume id1')
+})
+
 test('long clips are sampled slower so they stay under 900 frames', () => {
   expect(sampleRate(10)).toBe(12)
   expect(sampleRate(150)).toBe(6)

@@ -10,21 +10,24 @@
   <a href="#install"><img src="https://img.shields.io/badge/Claude_Code-plugin-D97757?logo=claude&logoColor=white" alt="Claude Code plugin"></a>
   <a href="#install"><img src="https://img.shields.io/badge/Ghostty-supported-3B82F6?logo=gnometerminal&logoColor=white" alt="Works in Ghostty"></a>
   <a href="#install"><img src="https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white" alt="macOS"></a>
+  <a href="#windows"><img src="https://img.shields.io/badge/Windows_11-Rio-0078D4?logo=windows&logoColor=white" alt="Windows 11 in Rio"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/iamumeransari/claude-show-your-work?color=22C55E" alt="MIT license"></a>
 </p>
 
 claude-show-your-work is a Claude Code plugin that displays images and plays videos in the chat. Claude uses it to show what it has made, such as a web page, a design, a chart or a video, and to play recordings of your app while it tests it.
+
+> **This fork** adds native Windows 11 support (no WSL), in the Rio terminal: see [Windows](#windows). It also turns automatic updates and usage stats off unless you turn them on. The original is [iamumeransari/claude-show-your-work](https://github.com/iamumeransari/claude-show-your-work).
 
 ## Install
 
 Run these two commands in Claude Code:
 
 ```
-/plugin marketplace add https://github.com/iamumeransari/claude-show-your-work.git
-/plugin install show-your-work@iamumeransari
+/plugin marketplace add https://github.com/vascc124/claude-show-your-work.git
+/plugin install show-your-work@vascc124
 ```
 
-The plugin requires macOS, Claude Code 2.1.287 or later, and the Ghostty terminal. Videos also require ffmpeg, which you can install with `brew install ffmpeg` or by asking Claude to install it.
+The plugin requires Claude Code 2.1.287 or later and a terminal that can draw pictures: Ghostty on macOS or Linux, or Rio set up as described under [Windows](#windows). Videos also require ffmpeg, which you can install with `brew install ffmpeg`, `winget install Gyan.FFmpeg` on Windows, or by asking Claude to install it.
 
 ## Usage
 
@@ -80,19 +83,39 @@ The plugin works in Ghostty. iTerm2, Terminal.app and the VS Code terminal can't
 
 In tmux, add `set -g allow-passthrough on` to `~/.tmux.conf`. If the setting is off, the plugin shows you how to turn it on.
 
+## Windows
+
+On Windows 11 the plugin works in [Rio](https://rioterm.com) once Rio has two things. Windows Terminal, WezTerm and the VS Code terminal can't draw these images yet.
+
+1. **Microsoft's newer ConPTY next to `rio.exe`.** Every Windows terminal talks to programs through ConPTY, and the copy built into Windows drops the escape codes that carry pictures. Microsoft publishes a newer one as the [`Microsoft.Windows.Console.ConPTY`](https://www.nuget.org/packages/Microsoft.Windows.Console.ConPTY) package, and Rio uses `conpty.dll` and `OpenConsole.exe` when they sit beside it.
+2. **Two variables in Rio's config.** Claude Code turns pictures on by itself only in kitty and Ghostty, so `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` tells it Rio can draw them. Claude Code also marks each picture with a text color, which needs at least 256 colors, so `FORCE_COLOR=3` tells it Rio has full color. Setting them in Rio's config keeps them out of other terminals, where they would draw garbage.
+
+The setup script does both. Run it once in an admin PowerShell:
+
+```powershell
+winget install raphamorim.rio
+winget install Gyan.FFmpeg
+git clone https://github.com/vascc124/claude-show-your-work
+powershell -ExecutionPolicy Bypass -File .\claude-show-your-work\scripts\setup-rio-windows.ps1
+```
+
+It downloads the ConPTY package from nuget.org, checks it against a pinned hash and Microsoft's signature, copies the two files into Rio's folder, and adds the variables to `%LOCALAPPDATA%\rio\config.toml`. Then open Rio and run `claude`.
+
+The plugin's file work uses the Unix tools that come with Git for Windows, which Claude Code on Windows already requires.
+
 ## FAQ
 
 ### Does it update itself?
 
-Yes. When Claude Code starts, the plugin checks GitHub for a new version once a day and installs it. Set `SHOW_YOUR_WORK_AUTO_UPDATE=0` to turn this off.
+Not in this fork, unless you set `SHOW_YOUR_WORK_AUTO_UPDATE=1`. Then, when Claude Code starts, it checks this fork on GitHub for a new version once a day and installs it.
 
 ### Does it collect any data?
 
-It sends anonymous usage counts, such as which versions are in use and how often images and videos are shown. It never sends files, file names, paths, prompts or anything you write, and it never records your IP address or location. Set `SHOW_YOUR_WORK_TELEMETRY=0` to turn it off.
+Not in this fork, unless you set `SHOW_YOUR_WORK_TELEMETRY=1`. Then it sends anonymous usage counts, such as which versions are in use and how often images and videos are shown. It never sends files, file names, paths, prompts or anything you write, and it never records your IP address or location.
 
 ## Feedback
 
-To report a bug or suggest a change, [open an issue](https://github.com/iamumeransari/claude-show-your-work/issues).
+To report a bug or suggest a change, [open an issue](https://github.com/iamumeransari/claude-show-your-work/issues). For anything about Windows, open it [in this fork](https://github.com/vascc124/claude-show-your-work/issues).
 
 <details>
 <summary><b>For developers</b></summary>

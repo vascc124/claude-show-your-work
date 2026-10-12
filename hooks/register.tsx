@@ -104,10 +104,13 @@ export const player = (site: string): Player => {
 }
 
 // A typed or dragged-in path: quotes, backslash-escaped spaces and ~ allowed.
-export function expand(path: string, base: string, homeDir: string): string {
-  let p = path.trim().replace(/^(['"])(.*)\1$/, '$2').replace(/\\(.)/g, '$1')
+// On Windows a backslash is a separator, made forward, and a Git Bash path
+// (/c/Users/...) becomes the drive path it names.
+export function expand(path: string, base: string, homeDir: string, win = isWin): string {
+  let p = path.trim().replace(/^(['"])(.*)\1$/, '$2')
+  p = win ? p.replace(/\\/g, '/').replace(/^\/([a-z])\//i, (_, d: string) => `${d.toUpperCase()}:/`) : p.replace(/\\(.)/g, '$1')
   if (p === '~' || p.startsWith('~/')) p = homeDir + p.slice(1)
-  if (p.startsWith('/')) return p
+  if (p.startsWith('/') || (win && /^[a-z]:\//i.test(p))) return p
 
   return `${base.replace(/\/$/, '')}/${p}`
 }
@@ -141,8 +144,70 @@ export const clock = (s: number) => `${Math.floor(Math.max(0, s) / 60)}:${String
 // macOS unless the session says Linux: every Linux path below is a branch
 // beside the macOS one, which stays as it was.
 let isMac = true
+// Windows, from the session's OS variable. Pictures convert as on Linux
+// (ffmpeg), and the Unix tools the scripts here use come from Git for
+// Windows, which Claude Code on Windows already needs.
+let isWin = false
+let usrBin = ''
+
+// A Windows path written with forward slashes, which Git's tools, ffmpeg and
+// the terminal all read; other systems' paths stay as they are.
+const slash = (path: string) => (isWin ? path.replace(/\\/g, '/') : path)
+// A Unix tool by name: on Windows, the one in Git for Windows' usr/bin.
+const unix = (name: string) => (isWin ? `${usrBin}/${name}.exe` : name)
+// Runs a script in sh with its arguments as $0, $1...; on Windows Git's
+// sh, with its own tools first on the PATH, so `find` is never Windows' own.
+const sh = ($: EngineInterface, script: string, ...args: string[]) =>
+  $.process.run([unix('sh'), '-c', isWin ? `PATH=/usr/bin:$PATH\n${script}` : script, ...args])
+
+// A small text file's content, or null when it can't be read.
+async function readText($: EngineInterface, file: string): Promise<string | null> {
+  if (isWin) return ($.fs.read(file) as Promise<string>).catch(() => null)
+  const r = await $.process.run(['cat', file]).catch(() => null)
+
+  return r && r.exitCode === 0 ? r.stdout : null
+}
+
 // Opens a file or URL with the desktop's default app.
 const openCommand = () => (isMac ? 'open' : 'xdg-open')
+const isUrl = (target: string) => /^[a-z][a-z0-9+.-]*:\/\//i.test(target)
+// The command that opens it; Windows' file handler wants backslashes.
+const openArgv = (target: string) =>
+  isWin
+    ? ['rundll32.exe', 'url.dll,FileProtocolHandler', isUrl(target) ? target : target.replace(/\//g, '\\')]
+    : [openCommand(), target]
+// Shows a file in its folder. Explorer exits 1 even when it worked, so on
+// Windows the run counts as done once it starts.
+async function reveal($: EngineInterface, file: string) {
+  if (!isWin) return $.process.run(isMac ? ['open', '-R', file] : ['xdg-open', file.slice(0, file.lastIndexOf('/')) || '/'])
+  await $.process.run(['explorer.exe', `/select,${file.replace(/\//g, '\\')}`])
+
+  return { exitCode: 0, stdout: '', stderr: '' }
+}
+
+// Git for Windows' usr/bin: from Claude Code's own setting for Git Bash,
+// beside the git on the PATH, or where the installer puts it.
+async function gitUsrBin($: EngineInterface): Promise<string> {
+  const bash = await $.env.get('CLAUDE_CODE_GIT_BASH_PATH')
+  const found = await $.process.run(['where.exe', 'git']).catch(() => null)
+  const roots = [
+    ...(bash ? [slash(bash).replace(/(\/usr)?\/bin\/bash\.exe$/i, '')] : []),
+    ...(found?.stdout ?? '').split(/\r?\n/).map(l => l.trim()).filter(Boolean).map(g => slash(g).replace(/\/(cmd|bin|mingw64\/bin)\/git\.exe$/i, '')),
+    'C:/Program Files/Git',
+  ]
+  for (const root of roots) {
+    if (await $.fs.exists(`${root}/usr/bin/sh.exe`).catch(() => false)) return `${root}/usr/bin`
+  }
+
+  return 'C:/Program Files/Git/usr/bin'
+}
+
+// ffmpeg and ffprobe on Windows: the first `where` finds, '' when missing.
+async function whereIs($: EngineInterface, name: string): Promise<string> {
+  const r = await $.process.run(['where.exe', name]).catch(() => null)
+
+  return slash((r?.exitCode === 0 ? r.stdout : '').split(/\r?\n/)[0]?.trim() ?? '')
+}
 
 // A PNG's size from its header (bytes 16 to 24), without any tool.
 export function pngDims(base64: string): { width: number; height: number } | null {
@@ -155,7 +220,7 @@ export function pngDims(base64: string): { width: number; height: number } | nul
 
 // Finds a pasted image's original file by name with Spotlight (macOS).
 async function findPasted($: EngineInterface, name: string): Promise<string | null> {
-  if (name.startsWith('/')) return name
+  if (name.startsWith('/') || (isWin && /^[a-z]:[\\/]/i.test(name))) return slash(name)
   if (!isMac) return null
   const found = await $.process.run(['mdfind', '-name', name])
 
@@ -182,7 +247,7 @@ const FRAMES_CAP_KB = 500_000
 // Folders this session is playing are never trimmed.
 function trimFrames($: EngineInterface) {
   const inUse = [...watching.keys()].map(d => d.split('/').pop()!).join(' ')
-  return $.process.run(['sh', '-c', TRIM_SH, TMP, String(FRAMES_CAP_KB), inUse]).catch(() => undefined)
+  return sh($, TRIM_SH, TMP, String(FRAMES_CAP_KB), inUse).catch(() => undefined)
 }
 
 // A recording often opens on a blank page while the browser loads: white,
@@ -237,7 +302,12 @@ export const NO_FFMPEG =
 export const NO_FFMPEG_LINUX =
   "videos and pictures other than PNG need ffmpeg, and it isn't installed. Install it with your package manager, " +
   'for example `sudo apt install ffmpeg` or `sudo dnf install ffmpeg` (Claude can run that for you), then restart Claude Code.'
-export const noFfmpeg = (mac: boolean) => (mac ? NO_FFMPEG : NO_FFMPEG_LINUX)
+// On Windows: winget instead of a package manager.
+export const NO_FFMPEG_WINDOWS =
+  "videos and pictures other than PNG need ffmpeg, and it isn't installed. Install it with `winget install Gyan.FFmpeg` " +
+  '(Claude can run that for you), then restart Claude Code.'
+export const FFMPEG_PROMPT_WINDOWS = 'Install ffmpeg for me with `winget install Gyan.FFmpeg`. Then show it again.'
+export const noFfmpeg = (mac: boolean, win = isWin) => (win ? NO_FFMPEG_WINDOWS : mac ? NO_FFMPEG : NO_FFMPEG_LINUX)
 export const FFMPEG_PROMPT_LINUX =
   "Install ffmpeg for me with this machine's package manager (for example `sudo apt install ffmpeg`). Then show it again."
 
@@ -256,6 +326,10 @@ export function noticeOf(err: unknown, path: string, homeDir = ''): Notice {
   const raw = String((err as Error)?.message ?? err)
   const shown = homeDir && path.startsWith(homeDir + '/') ? '~' + path.slice(homeDir.length) : path
   const name = path.split('/').pop() || path
+  if (raw.includes(NO_FFMPEG_WINDOWS)) return {
+    kind: 'no_ffmpeg', title: 'This needs ffmpeg', message: NO_FFMPEG_WINDOWS, prompt: FFMPEG_PROMPT_WINDOWS,
+    text: "ffmpeg isn't installed, so videos and pictures other than PNG can't show here. Copy the prompt and paste it to Claude to install it, or run `winget install Gyan.FFmpeg` yourself.",
+  }
   if (raw.includes(NO_FFMPEG_LINUX)) return {
     kind: 'no_ffmpeg', title: 'This needs ffmpeg', message: NO_FFMPEG_LINUX, prompt: FFMPEG_PROMPT_LINUX,
     text: "ffmpeg isn't installed, so videos and pictures other than PNG can't show here. Copy the prompt and paste it to Claude to install it, or install it yourself, for example `sudo apt install ffmpeg`.",
@@ -316,15 +390,21 @@ async function identityOf($: EngineInterface, raw: string): Promise<string | und
   return st ? keyOf(`${st.realPath ?? raw}|${st.size}|${st.mtimeMs}`) : undefined
 }
 async function readMeta<T>($: EngineInterface, dir: string): Promise<T | null> {
-  const r = await $.process.run(['cat', `${dir}/meta.json`]).catch(() => null)
-  if (!r || r.exitCode !== 0) return null
-  try { return JSON.parse(r.stdout) as T } catch { return null }
+  const text = await readText($, `${dir}/meta.json`)
+  if (text === null) return null
+  try { return JSON.parse(text) as T } catch { return null }
 }
 const writeMeta = ($: EngineInterface, dir: string, meta: unknown) =>
-  $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0/meta.json"', dir, JSON.stringify(meta)]).catch(() => undefined)
+  isWin
+    ? $.fs.write(`${dir}/meta.json`, JSON.stringify(meta)).catch(() => undefined)
+    : $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0/meta.json"', dir, JSON.stringify(meta)]).catch(() => undefined)
 
 async function prepareVideo($: EngineInterface, real: string, title: string, key?: string): Promise<Shown> {
   if (!hasVideoTools) {
+    if (isWin) {
+      ffmpeg = (await whereIs($, 'ffmpeg')) || ffmpeg
+      ffprobe = (await whereIs($, 'ffprobe')) || ffprobe
+    }
     hasVideoTools = (await Promise.all([exists($, ffmpeg), exists($, ffprobe)])).every(Boolean)
     if (!hasVideoTools) throw new Error(noFfmpeg(isMac))
   }
@@ -334,7 +414,7 @@ async function prepareVideo($: EngineInterface, real: string, title: string, key
     const meta = await readMeta<{ frames: Omit<Frames, 'dir'>; width: number; height: number }>($, dir)
     if (meta) {
       const frames = { ...meta.frames, dir }
-      await $.process.run(['touch', dir]).catch(() => undefined)
+      await $.process.run([unix('touch'), dir]).catch(() => undefined)
       await ensureChunk($, frames, real, 0)
       return { kind: 'video', path: frameFile(frames, 0), source: real, width: meta.width, height: meta.height, title, generation: ++generation, frames }
     }
@@ -346,7 +426,7 @@ async function prepareVideo($: EngineInterface, real: string, title: string, key
   const fps = sampleRate(Number.isFinite(probed) && probed > 0 ? probed : 1)
   generation += 1
   const dir = key ? `${TMP}/v-${key}` : `${TMP}/v${generation}-${Math.floor(await $.clock.now())}`
-  await $.process.run(['mkdir', '-p', dir])
+  await $.process.run([unix('mkdir'), '-p', dir])
   const lead = await whiteLead($, real, probed)
   const known = Number.isFinite(probed) && probed > 0
   // A clip of known length is decoded as it plays, a chunk at a time (see
@@ -391,7 +471,7 @@ function ensureChunk($: EngineInterface, f: Frames, source: string | undefined, 
     // The frame asked for, not the chunk's first: the poster outlives its chunk.
     if (await exists($, frameFile(f, Math.max(0, Math.min(i, f.count - 1))))) return
     if (!source) return
-    await $.process.run(['mkdir', '-p', f.dir])
+    await $.process.run([unix('mkdir'), '-p', f.dir])
     await $.process.run([
       ffmpeg, '-v', 'error', '-ss', String(+((f.lead ?? 0) + first / f.fps).toFixed(3)), '-i', source,
       '-vf', `fps=${f.fps},scale='min(960,iw)':-2`, '-frames:v', String(Math.min(CHUNK, f.count - first)),
@@ -422,7 +502,7 @@ async function prune($: EngineInterface, dir: string, c: number) {
     const i = Number(m[1]) - 1
     return i > 0 && !keep.some(k => i >= (k - 1) * CHUNK && i < (k + 3) * CHUNK)
   })
-  if (gone.length) await $.process.run(['rm', '-f', ...gone.map(n => `${dir}/${n}`)]).catch(() => undefined)
+  if (gone.length) await $.process.run([unix('rm'), '-f', ...gone.map(n => `${dir}/${n}`)]).catch(() => undefined)
 }
 
 // The frame a side shows, decoded if it has to be; past the middle of a
@@ -471,11 +551,10 @@ export function mapTime(points: [number, number][], t: number, endA: number, end
 // runs by eye. Small and sparse on purpose: matching costs frames × frames.
 async function thumbs($: EngineInterface, media: Shown, stride: number): Promise<number[][]> {
   const f = media.frames!
-  const r = await $.process.run([
-    'sh', '-c',
+  const r = await sh($,
     `"$0" -v error ${f.lead ? `-ss ${f.lead} ` : ''}-i "$1" -vf "fps=${f.fps},select=not(mod(n\\,${stride})),scale=32:18,format=gray" -fps_mode passthrough -frames:v ${Math.ceil(f.count / stride)} -f rawvideo - | od -An -tu1 -v`,
     ffmpeg, media.source ?? '',
-  ])
+  )
   const px = r.stdout.trim().split(/\s+/).map(Number)
   const out: number[][] = []
   for (let i = 0; i + 576 <= px.length; i += 576) out.push(px.slice(i, i + 576))
@@ -578,7 +657,7 @@ async function preparePair($: EngineInterface, original: Shown, updated: Shown) 
   const known = await readMeta<PairMeta>($, dir)
   if (known) {
     const pair = { ...known.pair, dir }
-    await $.process.run(['touch', dir]).catch(() => undefined)
+    await $.process.run([unix('touch'), dir]).catch(() => undefined)
     await pairChunk($, pair, updated, original, i => compareFrame({ ...updated, compare: original, sync: known.sync }, i), 0)
     return { pair, pairWidth: known.pairWidth, pairHeight: known.pairHeight, sync: known.sync }
   }
@@ -587,7 +666,7 @@ async function preparePair($: EngineInterface, original: Shown, updated: Shown) 
   const match = ta.length && tb.length
     ? spreadMatch(matchOf(align(ta, tb), ta.length), stride, f.count, g.count - 1)
     : Array.from({ length: f.count }, (_, i) => Math.min(g.count - 1, Math.round(mapTime(anchors(updated.checks, original.checks), i / f.fps, f.duration, g.duration) * g.fps)))
-  await $.process.run(['mkdir', '-p', dir])
+  await $.process.run([unix('mkdir'), '-p', dir])
   const pair = { dir, count: f.count, fps: f.fps, duration: f.duration }
   await pairChunk($, pair, updated, original, i => match[i] ?? 0, 0)
   if (!(await exists($, frameFile(pair, 0)))) return null
@@ -613,15 +692,15 @@ function pairChunk($: EngineInterface, pair: Frames, updated: Shown, original: S
     await ensureChunk($, f, updated.source, first)
     for (const jc of new Set(js.map(j => Math.floor(j / CHUNK)))) await ensureChunk($, g, original.source, jc * CHUNK)
     const tmp = `${pair.dir}/c${c}`
-    await $.process.run(['mkdir', '-p', `${tmp}/o`, `${tmp}/u`])
+    await $.process.run([unix('mkdir'), '-p', `${tmp}/o`, `${tmp}/u`])
     const links = js.map((j, k) => `ln -sf "${frameFile(g, j)}" "$0/o/f${String(k + 1).padStart(5, '0')}.png"; ln -sf "${frameFile(f, first + k)}" "$0/u/f${String(k + 1).padStart(5, '0')}.png"`).join('\n')
-    await $.process.run(['sh', '-c', links, tmp])
+    await sh($, links, tmp)
     await $.process.run([
       ffmpeg, '-v', 'error', '-framerate', String(f.fps), '-i', `${tmp}/o/f%05d.png`, '-framerate', String(f.fps), '-i', `${tmp}/u/f%05d.png`,
       '-filter_complex', `[0:v]scale=-2:360,pad=iw+${PAIR_GAP}:ih:0:0:color=${SIDEBAR.replace('#', '0x')}[a];[1:v]scale=-2:360[b];[a][b]hstack=inputs=2`,
       '-frames:v', String(n), '-start_number', String(first + 1), '-compression_level', '1', `${pair.dir}/f%05d.png`,
     ])
-    await $.process.run(['rm', '-rf', tmp])
+    await $.process.run([unix('rm'), '-rf', tmp])
     await prune($, pair.dir, c)
   })().catch(() => undefined).finally(() => decoding.delete(key))
   decoding.set(key, job)
@@ -643,14 +722,15 @@ async function pairReady($: EngineInterface, shown: Shown, i: number, site?: str
 async function prepare($: EngineInterface, raw: string, title?: string, key?: string): Promise<Shown> {
   const path = expand(raw, cwd, home)
   const stat = await $.fs.stat(path, { resolve: true })
-  const real = stat.realPath ?? path
+  const real = slash(stat.realPath ?? path)
   const name = title ?? real.split('/').pop()!
   if (VIDEO.test(real)) return prepareVideo($, real, name, key ?? (await identityOf($, real)))
   let png = real
   if (!/\.png$/i.test(real)) {
     generation += 1
     png = `${TMP}/${real.split('/').pop()!.replace(/\.[^.]+$/, '')}-${generation}.png`
-    await $.process.run(['mkdir', '-p', TMP])
+    await $.process.run([unix('mkdir'), '-p', TMP])
+    if (isWin && !(await exists($, ffmpeg))) ffmpeg = (await whereIs($, 'ffmpeg')) || ffmpeg
     if (!isMac && !(await exists($, ffmpeg))) throw new Error(noFfmpeg(false))
     const conv = isMac
       ? await $.process.run(['sips', '-s', 'format', 'png', real, '--out', png])
@@ -662,7 +742,7 @@ async function prepare($: EngineInterface, raw: string, title?: string, key?: st
   if ((size.size ?? 0) > 1_800_000) {
     generation += 1
     const small = `${TMP}/${png.split('/').pop()!.replace(/\.png$/i, '')}-${generation}-small.png`
-    await $.process.run(['mkdir', '-p', TMP])
+    await $.process.run([unix('mkdir'), '-p', TMP])
     const shrunk = isMac
       ? await $.process.run(['sips', '-Z', '1800', png, '--out', small])
       : await $.process.run([ffmpeg, '-v', 'error', '-y', '-i', png, '-vf', "scale='if(gt(iw,ih),min(1800,iw),-2)':'if(gt(iw,ih),-2,min(1800,ih))'", small]).catch(() => ({ exitCode: 1 }))
@@ -719,26 +799,26 @@ const STORE_CAP_KB = 200_000
 async function storeOf($: EngineInterface): Promise<string> {
   if (storeDir) return storeDir
   for (const dir of [`${cwd || home}/.show-your-work`, `${TMP}/store`]) {
-    const r = await $.process.run(['sh', '-c', 'mkdir -p "$0" && { [ -f "$0/.gitignore" ] || printf "*\\n" > "$0/.gitignore"; }', dir]).catch(() => null)
+    const r = await sh($, 'mkdir -p "$0" && { [ -f "$0/.gitignore" ] || printf "*\\n" > "$0/.gitignore"; }', dir).catch(() => null)
     if (r && r.exitCode === 0) return (storeDir = dir)
   }
   return (storeDir = `${TMP}/store`)
 }
 async function readVersion($: EngineInterface, dir: string, id: string): Promise<Version | null> {
   if (!/^[0-9a-f]{4,12}$/.test(id)) return null
-  const r = await $.process.run(['cat', `${dir}/${id}.json`]).catch(() => null)
-  if (!r || r.exitCode !== 0) return null
-  try { return JSON.parse(r.stdout) as Version } catch { return null }
+  const text = await readText($, `${dir}/${id}.json`)
+  if (text === null) return null
+  try { return JSON.parse(text) as Version } catch { return null }
 }
 async function storeVersion($: EngineInterface, raw: string, note: string, title: string | undefined, parent: string | undefined):
   Promise<{ real: string; copy: string; id: string; chain: { path: string; note?: string; id: string }[]; missing?: string }> {
-  const real = (await $.fs.stat(expand(raw, cwd, home), { resolve: true })).realPath ?? expand(raw, cwd, home)
+  const real = slash((await $.fs.stat(expand(raw, cwd, home), { resolve: true })).realPath ?? expand(raw, cwd, home))
   const dir = await storeOf($)
   const ext = real.match(/\.[^./]+$/)?.[0] ?? ''
   generation += 1
   const id = keyOf(`${real}|${await $.clock.now()}|${generation}`).slice(0, 6)
   const meta: Version = { id, ...(parent ? { parent } : {}), note, ext, title, origin: real }
-  const r = await $.process.run(['sh', '-c',
+  const r = await sh($,
     'cp -c "$1" "$0/$2$3" 2>/dev/null || cp "$1" "$0/$2$3" || exit 1\n' +
     'printf "%s" "$4" > "$0/$2.json"\n' +
     // Pictures and videos alike: kept 7 days, at most the newest 50, and at
@@ -746,7 +826,7 @@ async function storeVersion($: EngineInterface, raw: string, note: string, title
     'find "$0" -maxdepth 1 -name "*.json" -mtime +7 | while read f; do rm -f "${f%.json}".*; done\n' +
     'ls -t "$0"/*.json 2>/dev/null | tail -n +51 | while read f; do rm -f "${f%.json}".*; done\n' +
     'for f in $(ls -tr "$0"/*.json 2>/dev/null); do [ "$(du -sk "$0" | cut -f1)" -le "$5" ] && break; [ "$f" = "$0/$2.json" ] && break; rm -f "${f%.json}".*; done; true',
-    dir, real, id, ext, JSON.stringify(meta), String(STORE_CAP_KB)])
+    dir, real, id, ext, JSON.stringify(meta), String(STORE_CAP_KB))
   if (r.exitCode !== 0) return { real, copy: real, id, chain: [] }
   // Follow the links back, oldest first.
   const chain: { path: string; note?: string; id: string }[] = []
@@ -761,7 +841,7 @@ async function storeVersion($: EngineInterface, raw: string, note: string, title
   // Updated, no deeper history, so re-recordings don't pile up.
   if (VIDEO.test(real) && chain.length > 1) {
     const older = chain.slice(0, -1)
-    void $.process.run(['rm', '-f', ...older.map(v => v.path)]).catch(() => undefined)
+    void $.process.run([unix('rm'), '-f', ...older.map(v => v.path)]).catch(() => undefined)
     chain.splice(0, chain.length - 1)
   }
   return { real, copy: `${dir}/${id}${ext}`, id, chain, missing }
@@ -788,10 +868,10 @@ async function shownOf($: EngineInterface, output: unknown): Promise<Shown | nul
   if (!/^[0-9a-f]{4,12}$/.test(id)) return null
   const known = shownById.get(id)
   if (known) return known
-  const r = await $.process.run(['cat', `${await storeOf($)}/${id}.shown`]).catch(() => null)
-  if (!r || r.exitCode !== 0) return null
+  const text = await readText($, `${await storeOf($)}/${id}.shown`)
+  if (text === null) return null
   try {
-    const shown = JSON.parse(r.stdout) as Shown
+    const shown = JSON.parse(text) as Shown
     shownById.set(id, shown)
     return shown
   } catch {
@@ -1483,9 +1563,9 @@ function Actions(ui: Ui, $: EngineInterface, media: Shown, source: string, isNar
     const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, '']
     let out = `${home}/Downloads/${name}`
     for (let n = 2; await $.fs.stat(out).then(() => true, () => false); n++) out = `${home}/Downloads/${stem} ${n}${ext}`
-    if (!isMac) await $.process.run(['mkdir', '-p', `${home}/Downloads`])
-    const r = await $.process.run(['cp', source, out])
-    if (r.exitCode === 0) await $.process.run(isMac ? ['open', '-R', out] : ['xdg-open', `${home}/Downloads`]).catch(() => undefined)
+    if (!isMac) await $.process.run([unix('mkdir'), '-p', `${home}/Downloads`])
+    const r = await $.process.run([unix('cp'), source, out])
+    if (r.exitCode === 0) await (isMac || isWin ? reveal($, out) : $.process.run(['xdg-open', `${home}/Downloads`])).catch(() => undefined)
     done(r, `Saved to Downloads/${out.split('/').pop()}`)
   }
 
@@ -1494,7 +1574,7 @@ function Actions(ui: Ui, $: EngineInterface, media: Shown, source: string, isNar
       {!source.startsWith(`${home}/Downloads/`) ? (
         <Button key="keep" plain dimColor label="Save to Downloads" onPress={() => { act('save'); void keep() }} />
       ) : (
-        <Button key="reveal" plain dimColor label={isMac ? 'Show in Finder' : 'Show in folder'} onPress={() => act('reveal') || void $.process.run(isMac ? ['open', '-R', source] : ['xdg-open', source.slice(0, source.lastIndexOf('/')) || '/']).then(r => done(r, isMac ? 'Shown in Finder' : 'Opened the folder'))} />
+        <Button key="reveal" plain dimColor label={isMac ? 'Show in Finder' : 'Show in folder'} onPress={() => act('reveal') || void reveal($, source).then(r => done(r, isMac ? 'Shown in Finder' : 'Opened the folder'))} />
       )}
       {!isNarrow && (
         <Button
@@ -1520,8 +1600,9 @@ export function urlAt(shown: Shown, seconds: number): string | undefined {
 
 // Shown while pictures are drawn as cells: why, and the way back to full quality.
 // Resumes this chat outside the background service, so pictures draw again.
-export const resumeCommand = (id: string) =>
-  `CLAUDE_CODE_DISABLE_AGENT_VIEW=1 claude --resume${id ? ' ' + id : ''}`
+// PowerShell sets a variable for the command after it its own way.
+export const resumeCommand = (id: string, win = isWin) =>
+  `${win ? '$env:CLAUDE_CODE_DISABLE_AGENT_VIEW=1; ' : 'CLAUDE_CODE_DISABLE_AGENT_VIEW=1 '}claude --resume${id ? ' ' + id : ''}`
 
 // Why pictures can't draw here, once a draw has failed: tmux blocking them,
 // a terminal without picture support, or a background session.
@@ -1541,15 +1622,17 @@ export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'vide
     command: 'set -g allow-passthrough on', label: 'Copy setting', action: 'copy_tmux_setting',
     claude: `tmux is blocking pictures, so the person saw a notice instead of ${name}. They can add "set -g allow-passthrough on" to ~/.tmux.conf or open the chat outside tmux.`,
   }
+  // On Windows the terminal that draws them is Rio, set up as the README says.
+  const drawing = isWin ? 'Rio set up for pictures' : 'Ghostty'
   if (cause === 'terminal') return {
     title: `This terminal can't show ${what}`,
-    text: `"${name}" is ready, but this terminal can't draw ${what}. Open this chat in Ghostty to see it:`,
+    text: `"${name}" is ready, but this terminal can't draw ${what}. Open this chat in ${drawing} to see it:`,
     command: `claude --resume${id ? ' ' + id : ''}`, label: 'Copy command', action: 'copy_resume_command',
-    claude: `this terminal can't draw pictures, so the person saw a notice instead of ${name}. They need Ghostty to see it.`,
+    claude: `this terminal can't draw pictures, so the person saw a notice instead of ${name}. They need ${drawing} to see it.`,
   }
   return {
     title: `Can't show ${what} in a background session`,
-    text: `"${name}" is ready, but this chat is running as a background session, and those can't draw ${what} in the terminal. Resume it in a normal Ghostty tab to see it:`,
+    text: `"${name}" is ready, but this chat is running as a background session, and those can't draw ${what} in the terminal. Resume it in a normal ${isWin ? 'Rio' : 'Ghostty'} tab to see it:`,
     command: resumeCommand(id), label: 'Copy command', action: 'copy_resume_command',
     claude: `this chat runs as a background session, which can't draw pictures, so the person saw a notice instead of ${name}. They can resume the chat in a normal terminal tab to see it.`,
   }
@@ -1667,7 +1750,7 @@ async function Viewer(
       plain
       label={page ? '↗ Open page' : '↗ View'}
       onPress={() =>
-        act(page ? 'open_page' : 'open_file') || void $.process.run([openCommand(), page ?? source]).then(r =>
+        act(page ? 'open_page' : 'open_file') || void $.process.run(openArgv(page ?? source)).then(r =>
           $.ui.toast(r.exitCode === 0 ? `Opened ${(page ?? source.split('/').pop()!).slice(0, 60)}` : 'Could not open it'),
         )
       }
@@ -1814,9 +1897,10 @@ async function SplitView(
 // The one line a show call's row reads: what it shows, and what with.
 export function toolLine(tool: string, input: unknown, isRunning: boolean): string {
   const i = (input ?? {}) as { path?: string; title?: string; compare?: string; compare_label?: string; checks?: unknown[] }
-  const what = i.title ?? i.path?.split('/').pop() ?? ''
+  const nameOf = (path: string) => slash(path).split('/').pop()
+  const what = i.title ?? (i.path === undefined ? undefined : nameOf(i.path)) ?? ''
   const extra = [
-    i.compare ? `vs ${i.compare_label ?? i.compare.split('/').pop()}` : '',
+    i.compare ? `vs ${i.compare_label ?? nameOf(i.compare)}` : '',
     i.checks?.length ? `${i.checks.length} checks` : '',
   ].filter(Boolean)
   const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : isRunning ? 'Loading image' : 'Image'
@@ -1873,8 +1957,9 @@ const IMAGE_INPUT = {
 
 // Anonymous usage stats, sent to PostHog: what kind of thing happened and how
 // often, under a random id made once per install. Never a file name, path,
-// URL, title, prompt or anything typed. Off with SHOW_YOUR_WORK_TELEMETRY=0 or
-// DO_NOT_TRACK=1, and nothing is sent while POSTHOG_KEY is empty.
+// URL, title, prompt or anything typed. In this fork they are off unless
+// SHOW_YOUR_WORK_TELEMETRY=1; DO_NOT_TRACK=1 still wins, and nothing is sent
+// while POSTHOG_KEY is empty.
 const POSTHOG_HOST = 'https://us.i.posthog.com'
 // The project API key: it can only add events, never read them, so it ships.
 const POSTHOG_KEY = 'phc_mLGFguVcH3Tei4txwqXFPU4xBgFDKThEZncahTv3LS3W'
@@ -1905,10 +1990,10 @@ export function nicknameOf(id: string): string {
 
 async function startTelemetry($: EngineInterface, context: Props) {
   if (!POSTHOG_KEY) return
-  const optOut = await $.env.get('SHOW_YOUR_WORK_TELEMETRY')
+  const optIn = await $.env.get('SHOW_YOUR_WORK_TELEMETRY')
   const dnt = await $.env.get('DO_NOT_TRACK')
   const quiet = await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')
-  if (/^(0|false|off|no)$/i.test(optOut ?? '') || /^(1|true)$/i.test(dnt ?? '') || quiet) return
+  if (!/^(1|true|on|yes)$/i.test(optIn ?? '') || /^(1|true)$/i.test(dnt ?? '') || quiet) return
   installId = String((await $.store.get('installId')) ?? '')
   const isNew = !installId
   if (isNew) {
@@ -1958,9 +2043,10 @@ async function flush($: EngineInterface) {
 // Keeps the plugin current without the user turning on marketplace
 // auto-update: once a day it asks GitHub for the latest version and, when it
 // is newer, updates through Claude Code's own plugin commands. The new
-// version runs from the next session. Off with SHOW_YOUR_WORK_AUTO_UPDATE=0.
-const REPO = 'iamumeransari/claude-show-your-work'
-const MARKETPLACE = 'iamumeransari'
+// version runs from the next session. In this fork it is off unless
+// SHOW_YOUR_WORK_AUTO_UPDATE=1, and it follows the fork, not upstream.
+const REPO = 'vascc124/claude-show-your-work'
+const MARKETPLACE = 'vascc124'
 const PLUGIN = 'show-your-work'
 const LATEST = `https://raw.githubusercontent.com/${REPO}/main/.claude-plugin/plugin.json`
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -2003,8 +2089,8 @@ let pluginVersion = '0.0.0'
 let statsContext: Props = {}
 
 export async function checkForUpdate($: EngineInterface, current: string) {
-  const off = await $.env.get('SHOW_YOUR_WORK_AUTO_UPDATE')
-  if (/^(0|false|off|no)$/i.test(off ?? '')) return
+  const on = await $.env.get('SHOW_YOUR_WORK_AUTO_UPDATE')
+  if (!/^(1|true|on|yes)$/i.test(on ?? '')) return
   const now = await $.clock.now()
   if (now - Number((await $.store.get('updateCheckedAt')) ?? 0) < DAY_MS) return
   await $.store.set('updateCheckedAt', now)
@@ -2040,17 +2126,33 @@ export async function checkForUpdate($: EngineInterface, current: string) {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    cwd = started.cwd
+    isWin = (await $.env.get('OS')) === 'Windows_NT'
+    cwd = slash(started.cwd)
     sessionId = await $.session.id().catch(() => '')
-    const picked = await $.process.run(['sh', '-c', PICK_TMP]).catch(() => null)
-    if (picked && picked.exitCode === 0 && picked.stdout.trim().startsWith('/')) TMP = picked.stdout.trim()
-    const env = await $.process.run(['sh', '-lc', 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "os=$(uname -s)"'])
-    const got = (key: string) => env.stdout.split('\n').find(l => l.startsWith(`${key}=`))?.slice(key.length + 1).trim() ?? ''
-    const ff = got('ff'), fp = got('fp')
-    home = got('home')
-    isMac = got('os') !== 'Linux'
-    ffmpeg = ff || (isMac ? '/opt/homebrew/bin/ffmpeg' : '/usr/bin/ffmpeg')
-    ffprobe = fp || (isMac ? '/opt/homebrew/bin/ffprobe' : '/usr/bin/ffprobe')
+    let ff = '', fp = ''
+    if (isWin) {
+      // The user's own temp folder is private already; Git's tools do the
+      // scripts' work, and `where` finds ffmpeg (winget puts it on the PATH).
+      isMac = false
+      usrBin = await gitUsrBin($)
+      home = slash((await $.env.get('USERPROFILE')) ?? '')
+      TMP = `${slash((await $.env.get('TEMP')) ?? `${home}/AppData/Local/Temp`)}/claude-show-your-work`
+      await $.fs.write(`${TMP}/.keep`, '').catch(() => undefined)
+      ;[ff, fp] = await Promise.all([whereIs($, 'ffmpeg'), whereIs($, 'ffprobe')])
+      ffmpeg = ff || 'ffmpeg'
+      ffprobe = fp || 'ffprobe'
+    } else {
+      const picked = await $.process.run(['sh', '-c', PICK_TMP]).catch(() => null)
+      if (picked && picked.exitCode === 0 && picked.stdout.trim().startsWith('/')) TMP = picked.stdout.trim()
+      const env = await $.process.run(['sh', '-lc', 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "os=$(uname -s)"'])
+      const got = (key: string) => env.stdout.split('\n').find(l => l.startsWith(`${key}=`))?.slice(key.length + 1).trim() ?? ''
+      ff = got('ff')
+      fp = got('fp')
+      home = got('home')
+      isMac = got('os') !== 'Linux'
+      ffmpeg = ff || (isMac ? '/opt/homebrew/bin/ffmpeg' : '/usr/bin/ffmpeg')
+      ffprobe = fp || (isMac ? '/opt/homebrew/bin/ffprobe' : '/usr/bin/ffprobe')
+    }
     hasVideoTools = false
     void (async () => {
       const manifest = JSON.parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`)) as { version?: string }
@@ -2074,14 +2176,14 @@ export const register: Register = on => {
         claude_code_version: (await $.session.version().catch(() => ({ base: '' }))).base ?? '',
         terminal,
         has_ffmpeg: !!ff,
-        os: isMac ? 'macos' : 'linux',
+        os: isWin ? 'windows' : isMac ? 'macos' : 'linux',
       }
       await startTelemetry($, statsContext)
       await checkForUpdate($, pluginVersion)
     })().catch(() => undefined)
     // Frames and converted pictures a week old go; a window that scrolls back
     // into view cuts its frames again from the source.
-    void $.process.run(['sh', '-c', CLEAN_SH, TMP]).then(() => trimFrames($))
+    void sh($, CLEAN_SH, TMP).then(() => trimFrames($), () => undefined)
     await $.command.register({
       name: 'img',
       description: 'Show an image or video in a pane: /img <path>',
@@ -2260,7 +2362,10 @@ export const register: Register = on => {
       // Claude gets one short line; the drawing data stays out of its context.
       let mark = JSON.stringify(shown)
       if (kept.id) {
-        const saved = await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${kept.id}.shown`, mark]).catch(() => null)
+        const file = `${await storeOf($)}/${kept.id}.shown`
+        const saved = isWin
+          ? await $.fs.write(file, mark).then(() => ({ exitCode: 0 }), () => null)
+          : await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', file, mark]).catch(() => null)
         if (saved && saved.exitCode === 0) {
           shownById.set(kept.id, shown)
           mark = `#${kept.id}`
