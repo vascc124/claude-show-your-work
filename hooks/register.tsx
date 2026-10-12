@@ -2141,6 +2141,16 @@ export const register: Register = on => {
       ;[ff, fp] = await Promise.all([whereIs($, 'ffmpeg'), whereIs($, 'ffprobe')])
       ffmpeg = ff || 'ffmpeg'
       ffprobe = fp || 'ffprobe'
+      // Claude Code draws pictures on Windows only where it was told the
+      // terminal can (Rio, set up for it) or in a Ghostty build: anywhere else
+      // it is known before the first one, so Claude isn't told it can show them.
+      const forced = await $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES')
+      const where = `${(await $.env.get('TERM_PROGRAM')) ?? ''} ${(await $.env.get('TERM')) ?? ''}`
+      if (!/^(1|true|on|yes)$/i.test(forced ?? '') && !/ghostty|kitty/i.test(where)) {
+        canImage = false
+        probed = true
+        drawCause = 'terminal'
+      }
     } else {
       const picked = await $.process.run(['sh', '-c', PICK_TMP]).catch(() => null)
       if (picked && picked.exitCode === 0 && picked.stdout.trim().startsWith('/')) TMP = picked.stdout.trim()
